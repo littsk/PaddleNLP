@@ -47,6 +47,14 @@ from paddlenlp.transformers.model_outputs import (
 from paddlenlp.transformers.model_utils import PretrainedModel, register_base_model
 
 from .configuration import LlamaConfig
+from .sequence_parallel_utils import (
+    ColumnSequenceParallelLinear,
+    GatherOp,
+    RowSequenceParallelLinear,
+    ScatterOp,
+    mark_as_sequence_parallel_parameter,
+    register_sequence_parallel_allreduce_hooks,
+)
 
 LLAMA_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "__internal_testing__/tiny-random-llama",
@@ -224,14 +232,21 @@ def rms_norm_fused(x_in, w, eps):
 
 
 class LlamaRMSNorm(nn.Layer):
-    def __init__(self, config):
+    def __init__(self, config, is_last=False):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.sequence_parallel = config.sequence_parallel
+        self.is_last = is_last
+
         self.weight = paddle.create_parameter(
             shape=[self.hidden_size],
             dtype=paddle.get_default_dtype(),
             default_initializer=nn.initializer.Constant(1.0),
         )
+
+        if(self.sequence_parallel):
+            mark_as_sequence_parallel_parameter(self.weight)
+
         self.variance_epsilon = config.rms_norm_eps
         self.config = config
 
@@ -249,7 +264,16 @@ class LlamaRMSNorm(nn.Layer):
 
         if self.weight.dtype in [paddle.float16, paddle.bfloat16]:
             hidden_states = paddle.cast(hidden_states, self.weight.dtype)
-        return hidden_states * self.weight
+
+        hidden_states = hidden_states * self.weight
+
+        if self.sequence_parallel and self.is_last:
+            hidden_states = GatherOp.apply(hidden_states)
+            # convert shape from [seq_len, bsz, d_model] to [bsz, seq_len, d_model]
+            hidden_states = paddle.transpose(hidden_states, [1, 0, 2])
+        
+        return hidden_states
+
 
 
 class LlamaRotaryEmbedding(nn.Layer):
@@ -290,26 +314,89 @@ def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
     return q_embed, k_embed
 
 
+class LlamaEmbeddings(nn.Layer):
+    """
+    Include embeddings from word and position embeddings.
+    """
+
+    def __init__(
+        self,
+        config,
+        hidden_dropout_prob=0, #能否去掉
+        freeze_embedding=False, #能否去掉
+    ):
+        super(LlamaEmbeddings, self).__init__()
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        self.max_position_embeddings = config.max_position_embeddings
+        self.intermediate_size = config.intermediate_size
+        self.sequence_parallel = config.sequence_parallel
+
+        self.word_embeddings = fleet.meta_parallel.VocabParallelEmbedding(
+            self.vocab_size,
+            self.hidden_size,
+            weight_attr=paddle.ParamAttr(initializer=nn.initializer.XavierNormal()),
+        )
+
+        self.position_embeddings = nn.Embedding(
+            self.max_position_embeddings,
+            self.hidden_size,
+            weight_attr=paddle.ParamAttr(initializer=nn.initializer.XavierNormal()),
+        )
+
+        if freeze_embedding:
+            self.word_embeddings.weight.learning_rate = 0.0
+            self.position_embeddings.weight.learning_rate = 0.0
+
+        self.dropout = nn.Dropout(hidden_dropout_prob)
+
+    def forward(self, input_ids, position_ids=None):
+        input_embedings = self.word_embeddings(input_ids)
+
+        if position_ids is not None:
+            position_embeddings = self.position_embeddings(position_ids)
+            embeddings = input_embedings + position_embeddings
+        else:
+            embeddings = input_embedings
+
+        # if sequence parallel is true, change embedding shape [b, s, h] to [s, b, h]
+        # set the sequence dim as first, so the split in sequence dim is data-continuous
+        if self.sequence_parallel:
+            embeddings = paddle.transpose(embeddings, perm=[1, 0, 2])
+            embeddings = ScatterOp.apply(embeddings)
+            with mpu.get_rng_state_tracker().rng_state("local_seed"):
+                embeddings = self.dropout(embeddings)
+        else:
+            embeddings = self.dropout(embeddings)
+        return embeddings
+
 class LlamaMLP(nn.Layer):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
+        if config.sequence_parallel:
+            ColumnParallelLinear = ColumnSequenceParallelLinear
+            RowParallelLinear = RowSequenceParallelLinear
+        else:
+            ColumnParallelLinear = fleet.meta_parallel.ColumnParallelLinear
+            RowParallelLinear = fleet.meta_parallel.RowParallelLinear
+
         if config.tensor_parallel_degree > 1:
-            self.gate_proj = mpu.ColumnParallelLinear(
+            self.gate_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.intermediate_size,
                 gather_output=False,
                 has_bias=False,
             )
-            self.down_proj = mpu.RowParallelLinear(
+            self.down_proj = RowParallelLinear(
                 self.intermediate_size,
                 self.hidden_size,
                 input_is_parallel=True,
                 has_bias=False,
             )
-            self.up_proj = mpu.ColumnParallelLinear(
+            self.up_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.intermediate_size,
                 gather_output=False,
@@ -333,26 +420,34 @@ class LlamaAttention(nn.Layer):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
+        self.sequence_parallel = config.sequence_parallel
         if config.tensor_parallel_degree > 1:
             assert (
                 self.num_heads % config.tensor_parallel_degree == 0
             ), f"num_heads: {self.num_heads}, tensor_parallel_degree: {config.tensor_parallel_degree}"
             self.num_heads = self.num_heads // config.tensor_parallel_degree
 
+        if self.sequence_parallel:
+            ColumnParallelLinear = ColumnSequenceParallelLinear
+            RowParallelLinear = RowSequenceParallelLinear
+        else:
+            ColumnParallelLinear = fleet.meta_parallel.ColumnParallelLinear
+            RowParallelLinear = fleet.meta_parallel.RowParallelLinear
+
         if config.tensor_parallel_degree > 1:
-            self.q_proj = mpu.ColumnParallelLinear(
+            self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
                 has_bias=False,
                 gather_output=False,
             )
-            self.k_proj = mpu.ColumnParallelLinear(
+            self.k_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
                 has_bias=False,
                 gather_output=False,
             )
-            self.v_proj = mpu.ColumnParallelLinear(
+            self.v_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
                 has_bias=False,
@@ -376,7 +471,7 @@ class LlamaAttention(nn.Layer):
             )
 
         if config.tensor_parallel_degree > 1:
-            self.o_proj = mpu.RowParallelLinear(
+            self.o_proj = RowParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
                 has_bias=False,
@@ -400,10 +495,12 @@ class LlamaAttention(nn.Layer):
         use_cache: bool = False,
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
-        bsz, q_len, _ = hidden_states.shape
-        query_states = self.q_proj(hidden_states).reshape(shape=[bsz, q_len, self.num_heads, self.head_dim])
-        key_states = self.k_proj(hidden_states).reshape(shape=[bsz, q_len, self.num_heads, self.head_dim])
-        value_states = self.v_proj(hidden_states).reshape(shape=[bsz, q_len, self.num_heads, self.head_dim])
+        query_states = self.q_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
+        key_states = self.k_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
+        value_states = self.v_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
+
+        if self.sequence_parallel:
+            hidden_states = paddle.transpose(hidden_states, [1, 0, 2])
 
         kv_seq_len = key_states.shape[-3]
         offset = 0
@@ -431,6 +528,10 @@ class LlamaAttention(nn.Layer):
             attention_mask=attention_mask,
             output_attentions=output_attentions,
         )
+
+        if self.sequence_parallel:
+            hidden_states = paddle.transpose(hidden_states, [1, 0, 2])
+
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -590,6 +691,8 @@ class LlamaPretrainedModel(PretrainedModel):
                 mpu.VocabParallelEmbedding,
                 mpu.ColumnParallelLinear,
                 mpu.RowParallelLinear,
+                ColumnSequenceParallelLinear,
+                RowSequenceParallelLinear,
                 LlamaLMHead,
             ),
         ):
@@ -629,12 +732,11 @@ class LlamaModel(LlamaPretrainedModel):
         super().__init__(config)
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
+        self.sequence_parallel = config.sequence_parallel
 
         if config.tensor_parallel_degree > 1:
-            self.embed_tokens = mpu.VocabParallelEmbedding(
-                self.vocab_size,
-                self.hidden_size,
-                weight_attr=paddle.ParamAttr(initializer=nn.initializer.XavierNormal()),
+            self.embed_tokens = LlamaEmbeddings(
+                config,
             )
         else:
             self.embed_tokens = nn.Embedding(
@@ -883,6 +985,9 @@ class LlamaForCausalLM(LlamaPretrainedModel):
         self.llama = LlamaModel(config)
         self.lm_head = LlamaLMHead(config)
         self.criterion = LlamaPretrainingCriterion(config)
+
+        if config.sequence_parallel:
+            register_sequence_parallel_allreduce_hooks(self, config.accumulation_steps, config.fuse_sequence_parallel_allreduce)
 
     def get_input_embeddings(self):
         return self.llama.embed_tokens

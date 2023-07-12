@@ -208,6 +208,9 @@ class LlamaConfig(PretrainedConfig):
         use_cache=True,
         use_recompute=False,
         recompute_granularity="full",
+        sequence_parallel=False,
+        fuse_sequence_parallel_allreduce=False,
+        accumulation_steps=1,
         use_flash_attention=False,
         use_fused_rms_norm=False,
         tensor_parallel_output=True,
@@ -230,6 +233,9 @@ class LlamaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.use_recompute = use_recompute
         self.recompute_granularity = recompute_granularity
+        self.sequence_parallel = sequence_parallel
+        self.fuse_sequence_parallel_allreduce = fuse_sequence_parallel_allreduce
+        self.accumulation_steps = accumulation_steps
         self.use_flash_attention = use_flash_attention
         self.use_fused_rms_norm = use_fused_rms_norm
         self.tensor_parallel_output = tensor_parallel_output

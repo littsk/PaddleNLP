@@ -24,6 +24,8 @@ from typing import Optional
 import numpy as np
 import paddle
 
+from numba import cuda
+
 from paddlenlp.trainer import (
     PdArgumentParser,
     Trainer,
@@ -143,7 +145,15 @@ class ModelArguments:
         default=1,
         metadata={"help": "virtual_pp_degree"},
     )
-
+    sequence_parallel: bool = field(
+        default=False,
+        metadata={"help": "whether to use sequence parallel"},
+    )
+    fuse_sequence_parallel_allreduce: bool = field(
+        default=False,
+        metadata={"help": "whether to use fuse sequence parallel allreduce"},
+    )
+    
     continue_training: bool = field(
         default=False,
         metadata={
@@ -397,6 +407,8 @@ def main():
     config.fuse_attention_qkv = model_args.fuse_attention_qkv
     config.recompute_granularity = model_args.recompute_granularity
     config.virtual_pp_degree = model_args.virtual_pp_degree
+    config.sequence_parallel = model_args.sequence_parallel
+    config.accumulation_steps = training_args.gradient_accumulation_steps
     config.use_recompute = training_args.recompute
 
     config.tensor_parallel_degree = training_args.tensor_parallel_degree
@@ -471,7 +483,9 @@ def main():
 
     # Training
     if training_args.do_train:
+        cuda.profile_start()
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        cuda.profile_stop()
         metrics = train_result.metrics
         trainer.save_model()
         trainer.log_metrics("train", metrics)

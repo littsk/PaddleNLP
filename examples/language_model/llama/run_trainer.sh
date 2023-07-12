@@ -56,4 +56,6 @@ python -u  -m paddle.distributed.launch \
     --recompute 1 \
     --do_train \
     --do_eval \
-    --device "gpu"
+    --device "gpu" \
+    --sequence_parallel \
+    --accumulation_steps 1 \
