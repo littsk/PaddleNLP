@@ -45,7 +45,7 @@ python -u  -m paddle.distributed.launch \
     --virtual_pp_degree 1 \
     --learning_rate 0.00001 \
     --min_learning_rate 0.000001 \
-    --max_steps 100 \
+    --max_steps 1 \
     --save_steps 5000 \
     --weight_decay 0.01 \
     --warmup_ratio 0.01 \
@@ -56,8 +56,8 @@ python -u  -m paddle.distributed.launch \
     --report_to "visualdl" \
     --sharding "stage1" \
     --disable_tqdm true \
-    --continue_training 1\
     --recompute 1 \
     --do_train \
     --do_eval \
-    --device "gpu"
+    --device "gpu" \
+#    --sequence_parallel

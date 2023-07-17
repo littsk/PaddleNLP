@@ -213,6 +213,7 @@ class LlamaConfig(PretrainedConfig):
         accumulation_steps=1,
         use_flash_attention=False,
         use_fused_rms_norm=False,
+        fuse_attn_qkv=False,
         tensor_parallel_output=True,
         lm_shift_labels=True,
         pad_token_id=0,
@@ -238,6 +239,7 @@ class LlamaConfig(PretrainedConfig):
         self.accumulation_steps = accumulation_steps
         self.use_flash_attention = use_flash_attention
         self.use_fused_rms_norm = use_fused_rms_norm
+        self.fuse_attn_qkv = fuse_attn_qkv
         self.tensor_parallel_output = tensor_parallel_output
         self.lm_shift_labels = lm_shift_labels
 

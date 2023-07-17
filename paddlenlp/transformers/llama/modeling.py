@@ -39,6 +39,7 @@ except:
     flash_attention = None
 
 import warnings
+import nvtx
 
 from paddlenlp.transformers.model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -375,18 +376,20 @@ class LlamaMLP(nn.Layer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        self.tensor_parallel_degree = config.tensor_parallel_degree
 
         if config.sequence_parallel:
             ColumnParallelLinear = ColumnSequenceParallelLinear
             RowParallelLinear = RowSequenceParallelLinear
         else:
-            ColumnParallelLinear = fleet.meta_parallel.ColumnParallelLinear
-            RowParallelLinear = fleet.meta_parallel.RowParallelLinear
+            ColumnParallelLinear = mpu.ColumnParallelLinear
+            RowParallelLinear = mpu.RowParallelLinear
 
         if config.tensor_parallel_degree > 1:
-            self.gate_proj = ColumnParallelLinear(
+            # 为了减少张量并行的通信量，将两个linear合并成一个
+            self.gate_up_fused_proj = ColumnParallelLinear(
                 self.hidden_size,
-                self.intermediate_size,
+                self.intermediate_size * 2,
                 gather_output=False,
                 has_bias=False,
             )
@@ -396,19 +399,20 @@ class LlamaMLP(nn.Layer):
                 input_is_parallel=True,
                 has_bias=False,
             )
-            self.up_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.intermediate_size,
-                gather_output=False,
-                has_bias=False,
-            )
         else:
             self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
             self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias_attr=False)
             self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        nvtx.push_range("mlp fwd")
+        if(self.tensor_parallel_degree > 1):
+            gate_out, up_out = paddle.chunk(self.gate_up_fused_proj(x), chunks=2, axis=-1)
+            out = self.down_proj(F.silu(gate_out) * up_out)
+        else:
+            out = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        nvtx.pop_range()
+        return out
 
 
 class LlamaAttention(nn.Layer):
@@ -421,6 +425,8 @@ class LlamaAttention(nn.Layer):
         self.head_dim = self.hidden_size // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.sequence_parallel = config.sequence_parallel
+        self.fuse_attn_qkv = config.fuse_attn_qkv
+        
         if config.tensor_parallel_degree > 1:
             assert (
                 self.num_heads % config.tensor_parallel_degree == 0
@@ -435,40 +441,55 @@ class LlamaAttention(nn.Layer):
             RowParallelLinear = fleet.meta_parallel.RowParallelLinear
 
         if config.tensor_parallel_degree > 1:
-            self.q_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                has_bias=False,
-                gather_output=False,
-            )
-            self.k_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                has_bias=False,
-                gather_output=False,
-            )
-            self.v_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                has_bias=False,
-                gather_output=False,
-            )
+            if self.fuse_attn_qkv:
+                self.qkv_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    3 * self.hidden_size,
+                    has_bias=False,
+                    gather_output=False,
+                )
+            else:
+                self.q_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    has_bias=False,
+                    gather_output=False,
+                )
+                self.k_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    has_bias=False,
+                    gather_output=False,
+                )
+                self.v_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    has_bias=False,
+                    gather_output=False,
+                )
         else:
-            self.q_proj = nn.Linear(
-                self.hidden_size,
-                self.hidden_size,
-                bias_attr=False,
-            )
-            self.k_proj = nn.Linear(
-                self.hidden_size,
-                self.hidden_size,
-                bias_attr=False,
-            )
-            self.v_proj = nn.Linear(
-                self.hidden_size,
-                self.hidden_size,
-                bias_attr=False,
-            )
+            if self.fuse_attn_qkv:
+                self.qkv_proj = nn.Linear(
+                    self.hidden_size,
+                    3 * self.hidden_size,
+                    bias_attr=False,
+                )
+            else:
+                self.q_proj = nn.Linear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    bias_attr=False,
+                )
+                self.k_proj = nn.Linear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    bias_attr=False,
+                )
+                self.v_proj = nn.Linear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    bias_attr=False,
+                )
 
         if config.tensor_parallel_degree > 1:
             self.o_proj = RowParallelLinear(
@@ -495,12 +516,23 @@ class LlamaAttention(nn.Layer):
         use_cache: bool = False,
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
-        query_states = self.q_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
-        key_states = self.k_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
-        value_states = self.v_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
+        nvtx.push_range("attn fwd")
 
-        if self.sequence_parallel:
-            hidden_states = paddle.transpose(hidden_states, [1, 0, 2])
+        if(self.fuse_attn_qkv):
+            mix_layer = self.qkv_proj(hidden_states)
+            mix_layer = paddle.reshape_(mix_layer, [0, 0, self.num_heads, 3 * self.head_dim])
+            query_states, key_states, value_states = paddle.split(mix_layer, num_or_sections=3, axis=-1)
+        else:
+            query_states = self.q_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
+            key_states = self.k_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
+            value_states = self.v_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
+
+        nvtx.push_range("before transpose")
+        if(self.sequence_parallel):
+            query_states = query_states.transpose([1, 0, 2, 3])
+            key_states = key_states.transpose([1, 0, 2, 3])
+            value_states = value_states.transpose([1, 0, 2, 3])
+        nvtx.pop_range()
 
         kv_seq_len = key_states.shape[-3]
         offset = 0
@@ -530,13 +562,14 @@ class LlamaAttention(nn.Layer):
         )
 
         if self.sequence_parallel:
-            hidden_states = paddle.transpose(hidden_states, [1, 0, 2])
+            attn_output = paddle.transpose(attn_output, [1, 0, 2])
 
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
-
+            
+        nvtx.pop_range()
         return attn_output, attn_weights, past_key_value
 
 
@@ -745,7 +778,7 @@ class LlamaModel(LlamaPretrainedModel):
             )
 
         self.layers = nn.LayerList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = LlamaRMSNorm(config)
+        self.norm = LlamaRMSNorm(config, is_last=True)
 
         self.gradient_checkpointing = False
 

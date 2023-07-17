@@ -16,13 +16,13 @@ set -x
 unset CUDA_VISIBLE_DEVICES
 
 task_name="llama_hybid"
-rm -rf output/$task_name/
+# rm -rf output/$task_name/
 rm -rf "output/$task_name""_log"
 
 
 PYTHONPATH=../../../:$PYTHONPATH  \
 python -u  -m paddle.distributed.launch \
-    --gpus "0,1,2,3,4,5,6,7" \
+    --gpus "0,1,2,3" \
     --log_dir "output/$task_name""_log" \
     run_pretrain.py \
     --model_type "llama" \
@@ -52,10 +52,10 @@ python -u  -m paddle.distributed.launch \
     --eval_steps 1000 \
     --report_to "visualdl" \
     --disable_tqdm true \
-    --continue_training 1\
     --recompute 1 \
-    --do_train \
-    --do_eval \
+    --do_train 1\
     --device "gpu" \
-    --sequence_parallel \
-    --accumulation_steps 1 \
+    --tensor_parallel_degree 4 \
+    --sequence_parallel 1 \
+    --overwrite_output_dir 1 \
+    --fuse_attn_qkv 1
