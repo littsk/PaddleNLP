@@ -24,8 +24,6 @@ from typing import Optional
 import numpy as np
 import paddle
 
-from numba import cuda
-
 from paddlenlp.trainer import (
     PdArgumentParser,
     Trainer,
@@ -153,7 +151,7 @@ class ModelArguments:
         default=False,
         metadata={"help": "whether to use fuse attn qkv"},
     )
-    
+
     continue_training: bool = field(
         default=False,
         metadata={
@@ -484,9 +482,7 @@ def main():
 
     # Training
     if training_args.do_train:
-        cuda.profile_start()
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        cuda.profile_stop()
         metrics = train_result.metrics
         trainer.save_model()
         trainer.log_metrics("train", metrics)

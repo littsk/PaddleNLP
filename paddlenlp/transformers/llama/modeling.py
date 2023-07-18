@@ -39,6 +39,7 @@ except:
     flash_attention = None
 
 import warnings
+
 import nvtx
 
 from paddlenlp.transformers.model_outputs import (
@@ -148,8 +149,15 @@ def scaled_dot_product_attention(
             return_softmax=output_attentions,
         )
 
-        attn_output = attn_output.reshape([bsz, q_len, head_dim * num_heads])
+        if config.sequence_parallel:
+            nvtx.push_range("after transpose")
+            attn_output = paddle.transpose(attn_output, [2, 0, 1, 3])
+            nvtx.pop_range()
+            attn_output = attn_output.reshape([q_len, bsz, head_dim * num_heads])
+        else:
+            attn_output = attn_output.reshape([bsz, q_len, head_dim * num_heads])
         return attn_output, attn_weights
+
     else:
         query_states = paddle.transpose(query_states, [0, 2, 1, 3])
         # merge with the next tranpose
@@ -187,8 +195,13 @@ def scaled_dot_product_attention(
             attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").astype(query_states.dtype)
 
         attn_output = paddle.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose([0, 2, 1, 3])
-        attn_output = attn_output.reshape([bsz, q_len, head_dim * num_heads])
+
+        if config.sequence_parallel:
+            attn_output = paddle.transpose(attn_output, [2, 0, 1, 3])
+            attn_output = attn_output.reshape([q_len, bsz, head_dim * num_heads])
+        else:
+            attn_output = attn_output.transpose([0, 2, 1, 3])
+            attn_output = attn_output.reshape([bsz, q_len, head_dim * num_heads])
         return attn_output, attn_weights
 
 
@@ -245,7 +258,7 @@ class LlamaRMSNorm(nn.Layer):
             default_initializer=nn.initializer.Constant(1.0),
         )
 
-        if(self.sequence_parallel):
+        if self.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.weight)
 
         self.variance_epsilon = config.rms_norm_eps
@@ -272,9 +285,8 @@ class LlamaRMSNorm(nn.Layer):
             hidden_states = GatherOp.apply(hidden_states)
             # convert shape from [seq_len, bsz, d_model] to [bsz, seq_len, d_model]
             hidden_states = paddle.transpose(hidden_states, [1, 0, 2])
-        
-        return hidden_states
 
+        return hidden_states
 
 
 class LlamaRotaryEmbedding(nn.Layer):
@@ -323,8 +335,8 @@ class LlamaEmbeddings(nn.Layer):
     def __init__(
         self,
         config,
-        hidden_dropout_prob=0, #能否去掉
-        freeze_embedding=False, #能否去掉
+        hidden_dropout_prob=0,  # 能否去掉
+        freeze_embedding=False,  # 能否去掉
     ):
         super(LlamaEmbeddings, self).__init__()
         self.vocab_size = config.vocab_size
@@ -371,6 +383,7 @@ class LlamaEmbeddings(nn.Layer):
             embeddings = self.dropout(embeddings)
         return embeddings
 
+
 class LlamaMLP(nn.Layer):
     def __init__(self, config):
         super().__init__()
@@ -406,7 +419,7 @@ class LlamaMLP(nn.Layer):
 
     def forward(self, x):
         nvtx.push_range("mlp fwd")
-        if(self.tensor_parallel_degree > 1):
+        if self.tensor_parallel_degree > 1:
             gate_out, up_out = paddle.chunk(self.gate_up_fused_proj(x), chunks=2, axis=-1)
             out = self.down_proj(F.silu(gate_out) * up_out)
         else:
@@ -426,7 +439,7 @@ class LlamaAttention(nn.Layer):
         self.max_position_embeddings = config.max_position_embeddings
         self.sequence_parallel = config.sequence_parallel
         self.fuse_attn_qkv = config.fuse_attn_qkv
-        
+
         if config.tensor_parallel_degree > 1:
             assert (
                 self.num_heads % config.tensor_parallel_degree == 0
@@ -518,21 +531,28 @@ class LlamaAttention(nn.Layer):
         """Input shape: Batch x Time x Channel"""
         nvtx.push_range("attn fwd")
 
-        if(self.fuse_attn_qkv):
+        if self.fuse_attn_qkv:
             mix_layer = self.qkv_proj(hidden_states)
+
+            if self.sequence_parallel:
+                nvtx.push_range("before transpose")
+                mix_layer = mix_layer.transpose([1, 0, 2])
+                nvtx.pop_range()
+
             mix_layer = paddle.reshape_(mix_layer, [0, 0, self.num_heads, 3 * self.head_dim])
             query_states, key_states, value_states = paddle.split(mix_layer, num_or_sections=3, axis=-1)
+
         else:
             query_states = self.q_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
             key_states = self.k_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
             value_states = self.v_proj(hidden_states).reshape(shape=[0, 0, self.num_heads, self.head_dim])
 
-        nvtx.push_range("before transpose")
-        if(self.sequence_parallel):
-            query_states = query_states.transpose([1, 0, 2, 3])
-            key_states = key_states.transpose([1, 0, 2, 3])
-            value_states = value_states.transpose([1, 0, 2, 3])
-        nvtx.pop_range()
+            if self.sequence_parallel:
+                nvtx.push_range("before transpose")
+                query_states = query_states.transpose([1, 0, 2, 3])
+                key_states = key_states.transpose([1, 0, 2, 3])
+                value_states = value_states.transpose([1, 0, 2, 3])
+                nvtx.pop_range()
 
         kv_seq_len = key_states.shape[-3]
         offset = 0
@@ -561,14 +581,11 @@ class LlamaAttention(nn.Layer):
             output_attentions=output_attentions,
         )
 
-        if self.sequence_parallel:
-            attn_output = paddle.transpose(attn_output, [1, 0, 2])
-
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
-            
+
         nvtx.pop_range()
         return attn_output, attn_weights, past_key_value
 
@@ -1020,7 +1037,9 @@ class LlamaForCausalLM(LlamaPretrainedModel):
         self.criterion = LlamaPretrainingCriterion(config)
 
         if config.sequence_parallel:
-            register_sequence_parallel_allreduce_hooks(self, config.accumulation_steps, config.fuse_sequence_parallel_allreduce)
+            register_sequence_parallel_allreduce_hooks(
+                self, config.accumulation_steps, config.fuse_sequence_parallel_allreduce
+            )
 
     def get_input_embeddings(self):
         return self.llama.embed_tokens
