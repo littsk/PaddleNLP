@@ -40,10 +40,10 @@ python -u  -m paddle.distributed.launch \
     --fp16  \
     --fp16_opt_level "O2"  \
     --scale_loss 512 \
-    --tensor_parallel_degree 4 \
-    --pipeline_parallel_degree 2 \
+    --tensor_parallel_degree 8 \
+    --pipeline_parallel_degree 1 \
     --virtual_pp_degree 1 \
-    --sequence_parallel 0 \
+    --sequence_parallel 1 \
     --learning_rate 0.00001 \
     --min_learning_rate 0.000001 \
     --max_steps 10000 \
@@ -57,7 +57,7 @@ python -u  -m paddle.distributed.launch \
     --report_to "visualdl" \
     --sharding "stage1" \
     --disable_tqdm true \
-    --continue_training 1 \
+    --continue_training 0 \
     --recompute 0 \
     --recompute_granularity full \
     --do_train \

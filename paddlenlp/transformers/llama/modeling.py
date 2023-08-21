@@ -58,6 +58,7 @@ from ..sequence_parallel_utils import (
     ScatterOp,
     mark_as_sequence_parallel_parameter,
 )
+from . import smp
 from .configuration import LLAMA_PRETRAINED_INIT_CONFIGURATION, LlamaConfig
 
 LLAMA_PRETRAINED_MODEL_ARCHIVE_LIST = [
@@ -397,8 +398,8 @@ class LlamaMLP(nn.Layer):
         self.fuse_attention_ffn = config.fuse_attention_ffn
 
         if config.sequence_parallel:
-            ColumnParallelLinear = ColumnSequenceParallelLinear
-            RowParallelLinear = RowSequenceParallelLinear
+            ColumnParallelLinear = smp.SMPColumnParallelLinear
+            RowParallelLinear = smp.SMPRowParallelLinear
         else:
             ColumnParallelLinear = fleet.meta_parallel.ColumnParallelLinear
             RowParallelLinear = fleet.meta_parallel.RowParallelLinear
@@ -409,27 +410,27 @@ class LlamaMLP(nn.Layer):
                     self.hidden_size,
                     self.intermediate_size * 2,
                     gather_output=False,
-                    has_bias=False,
+                    # has_bias=False,
                 )
             else:
                 self.gate_proj = ColumnParallelLinear(
                     self.hidden_size,
                     self.intermediate_size,
                     gather_output=False,
-                    has_bias=False,
+                    # has_bias=False,
                 )
                 self.up_proj = ColumnParallelLinear(
                     self.hidden_size,
                     self.intermediate_size,
                     gather_output=False,
-                    has_bias=False,
+                    # has_bias=False,
                 )
 
             self.down_proj = RowParallelLinear(
                 self.intermediate_size,
                 self.hidden_size,
                 input_is_parallel=True,
-                has_bias=False,
+                # has_bias=False,
             )
         else:
             if config.fuse_attention_ffn:
@@ -1371,7 +1372,7 @@ class LlamaForCausalLM(LlamaPretrainedModel):
         tensor_parallel_output = (
             self.config.tensor_parallel_output and labels is not None and self.config.tensor_parallel_degree > 1
         )
-
+        # print("\n\n\n yes \n\n\n")
         logits = self.lm_head(hidden_states, tensor_parallel_output=tensor_parallel_output)
 
         loss = None
